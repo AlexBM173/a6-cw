@@ -1,13 +1,36 @@
+import os
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
+import numba
 import galsim
 import galsim.hsm
-from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Coordinate grids — cached by stamp shape to avoid recomputation
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=32)
+def _pixel_grids_cache(ny: int, nx: int):
+    """Compute and cache pixel-offset grids for a given stamp shape."""
+    cx = (nx - 1) / 2.0
+    cy = (ny - 1) / 2.0
+    x  = np.arange(nx, dtype=float) - cx
+    y  = np.arange(ny, dtype=float) - cy
+    return np.meshgrid(x, y)
 
 
 def _pixel_grids(image: galsim.Image):
     """
     Return (x, y) pixel-offset arrays relative to the image centre.
+
+    Results are cached by stamp shape; repeated calls with stamps of the
+    same size return the cached arrays without recomputation.
+
     Parameters
     ----------
     image : galsim.Image
@@ -19,13 +42,165 @@ def _pixel_grids(image: galsim.Image):
         from the image centre.
     """
     arr = image.array
-    ny, nx = arr.shape
-    cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
-    x_idx  = np.arange(nx, dtype=float) - cx
-    y_idx  = np.arange(ny, dtype=float) - cy
-    x, y   = np.meshgrid(x_idx, y_idx)
-    return x, y
+    return _pixel_grids_cache(*arr.shape)
 
+
+# ---------------------------------------------------------------------------
+# Numba-JIT moment kernels
+# ---------------------------------------------------------------------------
+# Both kernels are compiled once (cache=True) to ~/.cache/numba/ and reused.
+# nogil=True releases the Python GIL so ThreadPoolExecutor achieves real
+# parallelism across galaxy stamps.
+#
+# The key optimisation over the original NumPy implementation is that all
+# intermediate quantities (xbar, Q11, Q22, Q12 …) are accumulated in scalar
+# registers in a single pixel-level loop, eliminating every temporary array
+# allocation and reducing the number of memory passes from ~10 to 3.
+# ---------------------------------------------------------------------------
+
+@numba.njit(cache=True, nogil=True)
+def _unweighted_jit(arr):
+    """
+    Compute (e1, e2) from unweighted second moments.
+
+    Three passes over the pixel array:
+      pass 1 — intensity sum (I_sum) and centroid (xbar, ybar)
+      pass 2 — second moments Q11, Q22, Q12
+    All results accumulated in scalar registers; no intermediate arrays.
+    """
+    ny, nx = arr.shape
+    cx = (nx - 1) * 0.5
+    cy = (ny - 1) * 0.5
+
+    # Pass 1a: total flux
+    I_sum = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            I_sum += arr[i, j]
+    if I_sum <= 0.0:
+        return np.nan, np.nan
+
+    # Pass 1b: centroid
+    xbar = 0.0; ybar = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            v = arr[i, j]
+            xbar += v * (j - cx)
+            ybar += v * (i - cy)
+    xbar /= I_sum; ybar /= I_sum
+
+    # Pass 2: second moments
+    Q11 = 0.0; Q22 = 0.0; Q12 = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            dx = (j - cx) - xbar
+            dy = (i - cy) - ybar
+            v  = arr[i, j]
+            Q11 += v * dx * dx
+            Q22 += v * dy * dy
+            Q12 += v * dx * dy
+    Q11 /= I_sum; Q22 /= I_sum; Q12 /= I_sum
+
+    det = Q11 * Q22 - Q12 * Q12
+    if det < 0.0:
+        return np.nan, np.nan
+    denom = Q11 + Q22 + 2.0 * np.sqrt(det)
+    if denom <= 0.0:
+        return np.nan, np.nan
+
+    e1 = (Q11 - Q22) / denom
+    e2 = 2.0 * Q12  / denom
+    if abs(e1) > 1.0 or abs(e2) > 1.0:
+        return np.nan, np.nan
+    return e1, e2
+
+
+@numba.njit(cache=True, nogil=True)
+def _weighted_jit(arr, fwhm_px, max_iter, tol):
+    """
+    Compute (e1, e2) from Gaussian-weighted second moments.
+
+    Optimisations over the original NumPy implementation:
+    - All per-iteration array allocations (W, WI, dx, dy) are eliminated;
+      the Gaussian weight is computed per pixel in the inner loop.
+    - The convergence check uses shift² < tol² to avoid a sqrt per iteration.
+    - inv_2s2 is precomputed once rather than dividing by 2σ² on every pixel.
+    """
+    ny, nx = arr.shape
+    cx = (nx - 1) * 0.5
+    cy = (ny - 1) * 0.5
+    sigma   = fwhm_px / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    inv_2s2 = 1.0 / (2.0 * sigma * sigma)
+    tol2    = tol * tol
+
+    # Unweighted centroid as starting estimate
+    I_sum = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            I_sum += arr[i, j]
+    if I_sum <= 0.0:
+        return np.nan, np.nan
+    xbar = 0.0; ybar = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            v = arr[i, j]
+            xbar += v * (j - cx)
+            ybar += v * (i - cy)
+    xbar /= I_sum; ybar /= I_sum
+
+    # Iterative weighted centroid
+    for _ in range(max_iter):
+        WI = 0.0; xn = 0.0; yn = 0.0
+        for i in range(ny):
+            for j in range(nx):
+                dx = (j - cx) - xbar
+                dy = (i - cy) - ybar
+                w  = np.exp(-(dx*dx + dy*dy) * inv_2s2)
+                wi = w * arr[i, j]
+                WI += wi
+                xn += wi * (j - cx)
+                yn += wi * (i - cy)
+        if WI <= 0.0:
+            return np.nan, np.nan
+        xn /= WI; yn /= WI
+        shift2 = (xn - xbar)**2 + (yn - ybar)**2
+        xbar = xn; ybar = yn
+        if shift2 < tol2:
+            break
+
+    # Final weighted second moments
+    WI = 0.0; Q11 = 0.0; Q22 = 0.0; Q12 = 0.0
+    for i in range(ny):
+        for j in range(nx):
+            dx = (j - cx) - xbar
+            dy = (i - cy) - ybar
+            w  = np.exp(-(dx*dx + dy*dy) * inv_2s2)
+            wi = w * arr[i, j]
+            WI  += wi
+            Q11 += wi * dx * dx
+            Q22 += wi * dy * dy
+            Q12 += wi * dx * dy
+    if WI <= 0.0:
+        return np.nan, np.nan
+    Q11 /= WI; Q22 /= WI; Q12 /= WI
+
+    det = Q11 * Q22 - Q12 * Q12
+    if det < 0.0:
+        return np.nan, np.nan
+    denom = Q11 + Q22 + 2.0 * np.sqrt(det)
+    if denom <= 0.0:
+        return np.nan, np.nan
+
+    e1 = (Q11 - Q22) / denom
+    e2 = 2.0 * Q12  / denom
+    if abs(e1) > 1.0 or abs(e2) > 1.0:
+        return np.nan, np.nan
+    return e1, e2
+
+
+# ---------------------------------------------------------------------------
+# Public estimator API
+# ---------------------------------------------------------------------------
 
 def unweighted_ellipticity(image: galsim.Image):
     """
@@ -43,38 +218,7 @@ def unweighted_ellipticity(image: galsim.Image):
     -------
     (epsilon_1, epsilon_2) : floats, or (nan, nan) on failure.
     """
-    arr   = image.array.astype(float)
-    x, y  = _pixel_grids(image)
-
-    I_sum = arr.sum()
-    if I_sum <= 0:
-        return np.nan, np.nan
-
-    xbar = (arr * x).sum() / I_sum
-    ybar = (arr * y).sum() / I_sum
-    dx   = x - xbar
-    dy   = y - ybar
-
-    Q11  = (arr * dx * dx).sum() / I_sum
-    Q22  = (arr * dy * dy).sum() / I_sum
-    Q12  = (arr * dx * dy).sum() / I_sum
-    det  = Q11 * Q22 - Q12 ** 2
-
-    if det < 0:
-        return np.nan, np.nan
-
-    denom = Q11 + Q22 + 2.0 * np.sqrt(det)
-
-    if denom <= 0:
-        return np.nan, np.nan
-
-    epsilon_1 = (Q11 - Q22) / denom
-    epsilon_2 = 2 * Q12 / denom
-
-    if abs(epsilon_1) > 1.0 or abs(epsilon_2) > 1.0:
-        return np.nan, np.nan
-
-    return epsilon_1, epsilon_2
+    return _unweighted_jit(image.array.astype(np.float64))
 
 
 def _gaussian_weight(dx, dy, sigma):
@@ -134,65 +278,7 @@ def weighted_ellipticity_raw(image: galsim.Image, fwhm_px: float = 4.0, max_iter
     -------
     (epsilon_1, epsilon_2) : floats, or (nan, nan) on failure.
     """
-    arr  = image.array.astype(float)
-    x, y = _pixel_grids(image)
-
-    sigma = fwhm_px / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-
-    I_sum = arr.sum()
-    if I_sum <= 0:
-        return np.nan, np.nan
-    xbar = (arr * x).sum() / I_sum
-    ybar = (arr * y).sum() / I_sum
-
-    for _ in range(max_iter):
-        dx = x - xbar
-        dy = y - ybar
-
-        W      = _gaussian_weight(dx, dy, sigma)
-        WI     = W * arr
-        WI_sum = WI.sum()
-        if WI_sum <= 0:
-            return np.nan, np.nan
-
-        xbar_new = (WI * x).sum() / WI_sum
-        ybar_new = (WI * y).sum() / WI_sum
-
-        shift = np.sqrt((xbar_new - xbar)**2 + (ybar_new - ybar)**2)
-        xbar, ybar = xbar_new, ybar_new
-
-        if shift < tol:
-            break
-
-    dx   = x - xbar
-    dy   = y - ybar
-
-    W = _gaussian_weight(dx, dy, sigma)
-    WI = W * arr
-    WI_sum = WI.sum()
-    if WI_sum <= 0:
-        return np.nan, np.nan
-
-    Q11  = (WI * dx * dx).sum() / WI_sum
-    Q22  = (WI * dy * dy).sum() / WI_sum
-    Q12  = (WI * dx * dy).sum() / WI_sum
-    det  = Q11 * Q22 - Q12 ** 2
-
-    if det < 0:
-        return np.nan, np.nan
-
-    denom = Q11 + Q22 + 2.0 * np.sqrt(det)
-
-    if denom <= 0:
-        return np.nan, np.nan
-
-    epsilon_1 = (Q11 - Q22) / denom
-    epsilon_2 = 2 * Q12 / denom
-
-    if abs(epsilon_1) > 1.0 or abs(epsilon_2) > 1.0:
-        return np.nan, np.nan
-
-    return epsilon_1, epsilon_2
+    return _weighted_jit(image.array.astype(np.float64), fwhm_px, max_iter, tol)
 
 
 def hsm_ellipticity(image: galsim.Image):
@@ -345,6 +431,25 @@ def apply_simulation_calibration(
     return corr
 
 
+# ---------------------------------------------------------------------------
+# Parallel per-galaxy measurement
+# ---------------------------------------------------------------------------
+
+def _measure_single(im):
+    """
+    Run all three estimators on one galaxy stamp.
+
+    Called by ThreadPoolExecutor workers in measure_all_ellipticities.
+    The Numba JIT kernels (_unweighted_jit, _weighted_jit) and GalSim's
+    HSM (C++) all release the GIL, giving genuine thread-level parallelism.
+    """
+    arr = im.array.astype(np.float64)
+    e1_u, e2_u = _unweighted_jit(arr)
+    e1_w, e2_w = _weighted_jit(arr, 4.0, 20, 1e-3)
+    e1_h, e2_h, sg = hsm_ellipticity(im)
+    return e1_u, e2_u, e1_w, e2_w, e1_h, e2_h, sg
+
+
 def measure_all_ellipticities(stamps_path: Path):
     """
     Load all galaxy stamps and compute (e1, e2) for each estimator.
@@ -359,6 +464,10 @@ def measure_all_ellipticities(stamps_path: Path):
     is returned uncorrected. HSM returns adaptive-moment ellipticities that
     are already self-calibrated by construction.
 
+    Stamps are processed in parallel using a thread pool. The Numba JIT
+    kernels and GalSim's C++ HSM both release the GIL, so all available
+    CPU cores contribute.
+
     Returns
     -------
     dict with keys "unweighted", "weighted", "hsm", each an ndarray
@@ -368,17 +477,24 @@ def measure_all_ellipticities(stamps_path: Path):
     n_gals     = len(galaxy_ims)
     print(f"Loaded {n_gals} galaxy stamps from {stamps_path}")
 
+    # Trigger JIT compilation on a trivial array before the timed work begins.
+    _dummy = np.zeros((4, 4), dtype=np.float64)
+    _unweighted_jit(_dummy)
+    _weighted_jit(_dummy, 4.0, 20, 1e-3)
+
     e_unw    = np.full((n_gals, 2), np.nan)
     e_wgt    = np.full((n_gals, 2), np.nan)
     e_hsm    = np.full((n_gals, 2), np.nan)
     sigma_gs = np.full(n_gals,      np.nan)
 
-    for i, im in enumerate(galaxy_ims):
-        e_unw[i]       = unweighted_ellipticity(im)
-        e_wgt[i]       = weighted_ellipticity_raw(im, fwhm_px=4.0)
-        e1, e2, sg     = hsm_ellipticity(im)
-        e_hsm[i]       = e1, e2
-        sigma_gs[i]    = sg
+    n_workers = min(os.cpu_count() or 4, 16)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for i, res in enumerate(pool.map(_measure_single, galaxy_ims)):
+            e1_u, e2_u, e1_w, e2_w, e1_h, e2_h, sg = res
+            e_unw[i]    = e1_u, e2_u
+            e_wgt[i]    = e1_w, e2_w
+            e_hsm[i]    = e1_h, e2_h
+            sigma_gs[i] = sg
 
     print(f"\nMedian HSM galaxy size: sigma_g = {np.nanmedian(sigma_gs):.3f} px")
 

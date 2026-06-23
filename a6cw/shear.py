@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -49,6 +52,12 @@ def compute_tangential_ellipticities(
         epsilon_t = -(epsilon_1 * cos(2*phi) + epsilon_2 * sin(2*phi))
         epsilon_x = -(-epsilon_1 * sin(2*phi) + epsilon_2 * cos(2*phi))
 
+    cos(2φ) and sin(2φ) are evaluated via the trig-free double-angle
+    identities, avoiding arctan2 / cos / sin on the full (N_h × N_s) array:
+
+        cos(2φ) = (dx² − dy²) / r²
+        sin(2φ) = 2·dx·dy / r²
+
     epsilon_x is the cross (B-mode) component, rotated 45 degrees from
     the tangential direction.  Gravitational lensing produces only the
     tangential (E-mode) component, so <epsilon_x> = 0 is a null test:
@@ -67,16 +76,20 @@ def compute_tangential_ellipticities(
     epsilon_t_pairs : (N_h * N_s,) tangential ellipticities
     epsilon_x_pairs : (N_h * N_s,) cross ellipticities  (null-test quantity)
     """
-    dx  = source_pos[:, 0][np.newaxis, :] - halo_pos[:, 0][:, np.newaxis]
-    dy  = source_pos[:, 1][np.newaxis, :] - halo_pos[:, 1][:, np.newaxis]
-    r   = np.sqrt(dx**2 + dy**2)
-    phi = np.arctan2(dy, dx)
+    dx = source_pos[:, 0][np.newaxis, :] - halo_pos[:, 0][:, np.newaxis]
+    dy = source_pos[:, 1][np.newaxis, :] - halo_pos[:, 1][:, np.newaxis]
+    r2 = dx**2 + dy**2
+    r  = np.sqrt(r2)
+
+    # Trig-free double-angle formulae: eliminates arctan2, cos, sin calls.
+    # Guard against r²=0 (source coincident with halo) with np.where.
+    safe    = r2 > 0
+    inv_r2  = np.where(safe, 1.0 / np.where(safe, r2, 1.0), 0.0)
+    cos2phi = (dx**2 - dy**2) * inv_r2
+    sin2phi = 2.0 * dx * dy   * inv_r2
 
     e1 = epsilon_1[np.newaxis, :]
     e2 = epsilon_2[np.newaxis, :]
-
-    cos2phi = np.cos(2 * phi)
-    sin2phi = np.sin(2 * phi)
 
     epsilon_t = -(e1 * cos2phi + e2 * sin2phi)
     epsilon_x = -(-e1 * sin2phi + e2 * cos2phi)
@@ -101,6 +114,10 @@ def mean_tangential_shear(
         sigma(gt) = sqrt(Var(epsilon_t) / N)       [unweighted]
         sigma(gt) = sqrt(1 / sum(w_i))             [weighted, w_i = 1/sigma_i^2]
 
+    For the unweighted case, bin assignment is done with np.digitize (one
+    O(N log B) pass), and per-bin sums are accumulated with np.bincount,
+    replacing the original O(N·B) loop over repeated boolean masks.
+
     Parameters
     ----------
     r_pairs         : separations for all pairs [arcsec]
@@ -113,34 +130,46 @@ def mean_tangential_shear(
     -------
     gt      : mean tangential shear per bin  (N_bins,)
     gt_err  : 1-sigma uncertainty per bin    (N_bins,)
-    n_pairs : number of valid pairs per bin  (N_bins,)
+    n_pairs : number of valid (finite) pairs per bin  (N_bins,)
     """
     n_bins = len(bin_edges) - 1
-    gt      = np.zeros(n_bins)
-    gt_err  = np.zeros(n_bins)
+    gt      = np.full(n_bins, np.nan)
+    gt_err  = np.full(n_bins, np.nan)
     n_pairs = np.zeros(n_bins, dtype=int)
 
-    for k in range(n_bins):
-        in_bin = (r_pairs >= bin_edges[k]) & (r_pairs < bin_edges[k + 1])
-        et_bin = epsilon_t_pairs[in_bin]
+    # Single-pass bin assignment: O(N log B) vs the original O(N·B)
+    bin_idx = np.digitize(r_pairs, bin_edges) - 1   # 0-indexed; <0 or >=n_bins → outside
+    finite  = np.isfinite(epsilon_t_pairs)
+    valid   = finite & (bin_idx >= 0) & (bin_idx < n_bins)
 
-        finite = np.isfinite(et_bin)
-        et_bin = et_bin[finite]
-        n = len(et_bin)
-        n_pairs[k] = n
+    # Count finite pairs per bin in one vectorised call
+    n_pairs[:] = np.bincount(bin_idx[valid], minlength=n_bins)
+    has2 = n_pairs >= 2
 
-        if n < 2:
-            gt[k]     = np.nan
-            gt_err[k] = np.nan
-            continue
-
-        if weights is None:
-            gt[k]     = et_bin.mean()
-            gt_err[k] = et_bin.std(ddof=1) / np.sqrt(n)
-        else:
-            w_bin = weights[in_bin][finite]
-            w_sum = w_bin.sum()
-            gt[k]     = (w_bin * et_bin).sum() / w_sum
+    if weights is None:
+        # Fully vectorised path: sums and sum-of-squares via np.bincount
+        if has2.any():
+            bv   = bin_idx[valid]
+            et_v = epsilon_t_pairs[valid]
+            s1   = np.bincount(bv, weights=et_v,    minlength=n_bins)
+            s2   = np.bincount(bv, weights=et_v**2, minlength=n_bins)
+            n_f  = n_pairs.astype(float)
+            mean = np.where(has2, s1 / n_f, np.nan)
+            # Bessel-corrected variance: (Σx² − (Σx)²/n) / (n − 1)
+            var  = np.where(has2, (s2 - s1**2 / n_f) / (n_f - 1), np.nan)
+            gt[:]     = mean
+            gt_err[:] = np.where(has2, np.sqrt(np.maximum(var, 0.0) / n_f), np.nan)
+    else:
+        # Weighted path: per-bin loop (less common; bincount with weights
+        # cannot handle the 1/sqrt(Σw) error formula directly)
+        for k in range(n_bins):
+            if not has2[k]:
+                continue
+            mk    = valid & (bin_idx == k)
+            et_k  = epsilon_t_pairs[mk]
+            w_k   = weights[mk]
+            w_sum = w_k.sum()
+            gt[k]     = (w_k * et_k).sum() / w_sum
             gt_err[k] = np.sqrt(1.0 / w_sum)
 
     return gt, gt_err, n_pairs
@@ -337,15 +366,35 @@ def log_likelihood(
     return -0.5 * np.sum((residuals / gt_err[valid])**2)
 
 
+# ---------------------------------------------------------------------------
+# Parallel posterior grid
+# ---------------------------------------------------------------------------
+
+def _posterior_cell(args):
+    """
+    Top-level worker for ProcessPoolExecutor in compute_posterior_grid.
+
+    Must be a module-level function so it can be pickled by multiprocessing.
+    """
+    gt_data, gt_err, mass, zs = args
+    return log_likelihood(gt_data, gt_err, mass, zs)
+
+
 def compute_posterior_grid(
     gt_data: np.ndarray,
     gt_err: np.ndarray,
     mass_grid: np.ndarray,
     zs_grid: np.ndarray,
+    n_workers: int | None = None,
 ) -> np.ndarray:
     """
     Evaluate the (unnormalised) posterior on a 2D grid of (mass, z_source)
     using a flat (uniform) prior on both parameters.
+
+    Each grid cell is independent, so the evaluation is parallelised across
+    all available CPU cores using ProcessPoolExecutor. The Python GIL prevents
+    thread-based parallelism here (build_nfw_theory is pure Python), so
+    separate processes are used instead.
 
     Parameters
     ----------
@@ -353,20 +402,36 @@ def compute_posterior_grid(
     gt_err     : (N_bins,) 1-sigma uncertainties
     mass_grid  : (N_m,) halo mass values to evaluate
     zs_grid    : (N_z,) source redshift values to evaluate
+    n_workers  : number of worker processes (default: os.cpu_count())
 
     Returns
     -------
     log_post : (N_m, N_z) array of log-posterior values
     """
-    n_m = len(mass_grid)
-    n_z = len(zs_grid)
-    log_post = np.full((n_m, n_z), -np.inf)
+    n_m, n_z = len(mass_grid), len(zs_grid)
+    n_cells  = n_m * n_z
 
-    for i, mass in enumerate(mass_grid):
-        for j, zs in enumerate(zs_grid):
-            log_post[i, j] = log_likelihood(gt_data, gt_err, mass, zs)
+    if n_workers is None:
+        n_workers = os.cpu_count() or 4
 
-    return log_post
+    cells = [
+        (gt_data, gt_err, float(mass), float(zs))
+        for mass in mass_grid
+        for zs   in zs_grid
+    ]
+
+    if n_workers == 1 or n_cells < 50:
+        flat = [_posterior_cell(c) for c in cells]
+    else:
+        try:
+            chunksize = max(1, n_cells // (n_workers * 4))
+            with ProcessPoolExecutor(max_workers=n_workers) as exc:
+                flat = list(exc.map(_posterior_cell, cells, chunksize=chunksize))
+        except Exception:
+            # Fall back to serial (e.g., in restricted execution environments)
+            flat = [_posterior_cell(c) for c in cells]
+
+    return np.array(flat, dtype=float).reshape(n_m, n_z)
 
 
 def plot_joint_posterior(

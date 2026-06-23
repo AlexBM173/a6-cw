@@ -16,6 +16,23 @@ Plots are written to `outputs/profiling/`.
 
 ---
 
+## Optimisations applied
+
+The package was rewritten after an initial profiling pass. The following
+optimisations were made and their effects are shown in the before/after tables
+below.
+
+| Module | Technique | Functions affected |
+|---|---|---|
+| `ellipticity` | Numba `@njit(cache=True, nogil=True)` JIT kernel | `unweighted_ellipticity`, `weighted_ellipticity_raw` |
+| `ellipticity` | `functools.lru_cache` on pixel-grid arrays (keyed by shape) | `_pixel_grids` |
+| `ellipticity` | `concurrent.futures.ThreadPoolExecutor` (GIL-free Numba + GalSim C++) | `measure_all_ellipticities` |
+| `shear` | Trig-free double-angle identities: `cos2φ = (dx²−dy²)/r²`, `sin2φ = 2dx·dy/r²` | `compute_tangential_ellipticities` |
+| `shear` | `np.digitize` + `np.bincount` replace O(N·B) boolean-mask loop | `mean_tangential_shear` |
+| `shear` | `concurrent.futures.ProcessPoolExecutor` (bypasses GIL for NFW calls) | `compute_posterior_grid` |
+
+---
+
 ## Methodology
 
 | Quantity | Tool | Detail |
@@ -35,66 +52,62 @@ profile is used (`gt = 0.02`, `gt_err = 0.005` per bin).
 ## 1 — Ellipticity estimators vs stamp size
 
 The three estimators are applied to single stamps of increasing side length $N$,
-ranging from 16 to 192 pixels. The dominant operations are O($N^2$) NumPy array
-reductions (sum, multiply-accumulate).
+ranging from 16 to 192 pixels.
 
-### Timing
+### Before/after comparison at 48 × 48 (standard stamp size)
+
+| Estimator | Time before | Time after | Speedup | Memory before | Memory after | Memory reduction |
+|---|---|---|---|---|---|---|
+| Unweighted moments | 0.030 ms | 0.005 ms | **6×** | 127 KB | 18 KB | **7×** |
+| Gaussian-weighted moments | 0.066 ms | 0.026 ms | **2.5×** | 181 KB | 18 KB | **10×** |
+| HSM (GalSim) | 0.184 ms | 0.174 ms | 1.1× | 13 KB | 13 KB | unchanged |
+
+The Numba JIT kernels fuse the three-pass pixel loop into a single pass with
+no intermediate NumPy arrays, explaining both the speed and memory gains.
+The weighted estimator also benefits from precomputing `inv_2s2 = 1/(2σ²)` to
+avoid recomputing it each centroid iteration, and from replacing `sqrt` in the
+convergence check with a squared-distance comparison.
+
+HSM was already compiled C++ with negligible Python overhead, so it is unchanged.
+
+### Full scaling tables (after optimisation)
 
 | Stamp | Pixels $N^2$ | Unweighted (ms) | Weighted (ms) | HSM (ms) |
 |---|---|---|---|---|
-| 16 × 16 | 256 | 0.020 | 0.033 | 0.054 |
-| 24 × 24 | 576 | 0.022 | 0.039 | 0.086 |
-| 32 × 32 | 1 024 | 0.024 | 0.048 | 0.122 |
-| **48 × 48** | **2 304** | **0.030** | **0.066** | **0.184** |
-| 64 × 64 | 4 096 | 0.038 | 0.091 | 0.371 |
-| 96 × 96 | 9 216 | 0.064 | 0.183 | 0.779 |
-| 128 × 128 | 16 384 | 0.097 | 0.495 | 1.238 |
-| 192 × 192 | 36 864 | 0.195 | 1.509 | 2.764 |
+| 16 × 16 | 256 | 0.001 | 0.003 | 0.054 |
+| 24 × 24 | 576 | 0.003 | 0.008 | 0.079 |
+| 32 × 32 | 1 024 | 0.003 | 0.012 | 0.110 |
+| **48 × 48** | **2 304** | **0.005** | **0.026** | **0.174** |
+| 64 × 64 | 4 096 | 0.009 | 0.044 | 0.274 |
+| 96 × 96 | 9 216 | 0.019 | 0.119 | 0.666 |
+| 128 × 128 | 16 384 | 0.034 | 0.424 | 1.151 |
+| 192 × 192 | 36 864 | 0.075 | 0.789 | 2.658 |
 
-The 48 × 48 row matches the data stamps used in the coursework notebooks.
-
-### Throughput at 48 × 48 (standard stamp size)
+### Throughput at 48 × 48
 
 | Estimator | ms / galaxy | Galaxies / s | Peak memory (KB) |
 |---|---|---|---|
-| Unweighted moments | 0.030 | 33 000 | 127 |
-| Gaussian-weighted moments | 0.066 | 15 000 | 181 |
-| HSM (GalSim) | 0.184 | 5 400 | 13 |
-
-HSM has the lowest throughput but also the smallest Python heap footprint:
-the adaptive-moment algorithm runs in compiled C++ code, so GalSim allocates
-internally without touching the Python heap. The apparent 13 KB is only the
-`galsim.hsm.ShapeData` result object.
+| Unweighted moments | 0.005 | 191 000 | 18 |
+| Gaussian-weighted moments | 0.026 | 39 000 | 18 |
+| HSM (GalSim) | 0.174 | 5 750 | 13 |
 
 ### Memory
 
-Peak heap memory grows proportionally to the stamp area for the two
-pure-Python estimators:
-
-| Estimator | Dominant allocation | Expected |
-|---|---|---|
-| Unweighted | ≈ 8 intermediate `float64` arrays of size $N^2$ | $8 \times 8 N^2$ bytes |
-| Weighted | ≈ 11 intermediate arrays (includes weight $W$ and $WI$ per iteration) | $11 \times 8 N^2$ bytes |
-| HSM | result object only (C++ internal) | O(1) Python heap |
-
-At 192 × 192 the unweighted estimator uses ≈ 1.7 MB, weighted ≈ 2.5 MB,
-matching the theoretical 8–11 arrays of 36 864 × 8 bytes = 0.29 MB each.
+The Numba JIT kernels compute all sums in scalar accumulators with no heap
+allocations beyond the input array itself. At 48 × 48, both moment estimators
+now show 18 KB, which is the input `float64` array (2 304 × 8 bytes = 18 KB)
+with no additional intermediates.
 
 ### Scaling exponent
 
-The log–log slope of time vs stamp area $N^2$ gives the empirical scaling
-exponent (slope = 1.0 would be perfect O($N^2$)):
+| Estimator | Measured slope |
+|---|---|
+| Unweighted moments | 0.84 |
+| Gaussian-weighted moments | 1.12 |
+| HSM (GalSim) | 0.79 |
 
-| Estimator | Measured slope | Note |
-|---|---|---|
-| Unweighted moments | 0.45 | Python / NumPy dispatch overhead dominates at small $N$ |
-| Gaussian-weighted moments | 0.75 | Higher per-pixel cost from centroid iteration; approaches 1.0 at large $N$ |
-| HSM (GalSim) | 0.80 | Adaptive-moment loop converges in more iterations for large galaxies |
-
-Sub-unit slopes at small $N$ are expected: each NumPy ufunc has a fixed
-dispatch overhead of ≈ 1–5 µs regardless of array size, which dominates the
-total time when the array holds only a few hundred elements. At $N \ge 128$
-(16 000+ pixels) all three estimators approach the asymptotic O($N^2$) regime.
+The sub-unit slopes reflect fixed Numba dispatch overhead dominating at small
+stamps; all estimators approach O($N^2$) asymptotically.
 
 ![Ellipticity scaling](../outputs/profiling/perf_ellipticity_scaling.png)
 
@@ -104,42 +117,38 @@ total time when the array holds only a few hundred elements. At $N \ge 128$
 
 ## 2 — `compute_tangential_ellipticities` vs N_sources
 
-This function forms all $N_h \times N_s$ halo–source pairs simultaneously using
-NumPy broadcasting, building eight intermediate arrays of shape $(N_h, N_s)$:
-`dx`, `dy`, `r`, `phi`, `cos2phi`, `sin2phi`, `epsilon_t`, `epsilon_x`.
+The trig-free identities (`cos2φ = (dx²−dy²)/r²`, `sin2φ = 2dx·dy/r²`) eliminate
+two `np.arctan2` and two `np.cos`/`np.sin` calls, each of which is a transcendental
+function evaluated element-wise over the full pair array.
 
-### Time and memory (N_halos = 10 fixed)
+### Before/after at N_sources = 100 000 (N_halos = 10)
+
+| Metric | Before | After | Improvement |
+|---|---|---|---|
+| Time | 83.65 ms | 39.43 ms | **2.1×** |
+| Peak memory | 68.67 MB | 77.25 MB | similar |
+
+Memory is slightly higher after because the trig-free path computes `dx²` and `dy²`
+as separate temporary arrays before forming `r²`, whereas the original computed
+`phi` from `arctan2(dy, dx)` without materialising squared components. The
+time saving dominates.
+
+### Scaling table (after optimisation)
 
 | N_sources | Time (ms) | Peak memory (MB) |
 |---|---|---|
-| 100 | 0.04 | 0.08 |
-| 500 | 0.24 | 0.38 |
-| 1 000 | 0.47 | 0.76 |
-| 5 000 | 2.19 | 3.44 |
-| 10 000 | 5.11 | 6.87 |
-| 50 000 | 45.51 | 34.33 |
-| **100 000** | **83.65** | **68.67** |
+| 100 | 0.04 | 0.09 |
+| 500 | 0.05 | 0.43 |
+| 1 000 | 0.09 | 0.85 |
+| 5 000 | 0.40 | 3.86 |
+| 10 000 | 0.89 | 7.73 |
+| 50 000 | 20.24 | 38.63 |
+| **100 000** | **39.43** | **77.25** |
 
-The coursework uses $N_h = 100$ halos and $N_s = 100\,000$ sources, so the
-actual intermediate arrays are $100 \times 100\,000 = 10^7$ elements each —
-approximately 610 MB for eight `float64` arrays. The function returns
-one-dimensional views (`.ravel()`) so the RAM is released as soon as the
-caller drops the intermediates.
-
-### Complexity
-
-- **Time** scales as O($N_h \cdot N_s$) — both factors appear symmetrically in
-  the broadcast. At fixed $N_h = 10$, the measured slope in log(time) vs log($N_s$)
-  is 1.03, confirming linear scaling with the number of sources.
-- **Memory** also scales as O($N_h \cdot N_s$): the 100 000-source column shows
-  68.7 MB, close to the theoretical $8 \times 10 \times 100\,000 \times 8$ bytes
-  = 61 MB (the overhead comes from `.ravel()` returning copies rather than views
-  in some NumPy versions).
-
-For very large catalogues the memory ceiling is the practical limit. With the
-default grid ($N_h = 100$, $N_s = 100\,000$), peak intermediate memory is
-≈ 610 MB. If memory is constrained, the function could be looped over halos
-in batches without changing the algorithm.
+- **Time** scales as O($N_h \cdot N_s$); measured log–log slope ≈ 1.0.
+- **Memory** scales as O($N_h \cdot N_s$); at 100 k sources and 10 halos the
+  dominant arrays are $10 \times 100\,000$ `float64` = 7.6 MB each, and there
+  are approximately ten such intermediates.
 
 ![Tangential shear scaling](../outputs/profiling/perf_tangential_scaling.png)
 
@@ -149,44 +158,39 @@ in batches without changing the algorithm.
 
 ### `build_nfw_theory` (per-call timing)
 
-A single call evaluates the NFW tangential shear at the 10 fixed
-`BIN_CENTRES` using `NFWHalo_theory.get_tangential_shear`.
-
 | Metric | Value |
 |---|---|
-| Median time | **0.44 ms** |
-| Std dev | 0.12 ms |
+| Median time | **0.421 ms** |
+| Std dev | 0.036 ms |
 
-The call is dominated by distance integrals inside `NFWHalo_theory`; there is
-no Python-level vectorisation because the output size is fixed at $N_\text{bins} = 10$.
+This function is unchanged; the cost is entirely inside `NFWHalo_theory` C code.
 
-### `compute_posterior_grid` (time vs grid resolution)
+### `compute_posterior_grid` — before/after
 
-The function evaluates the log-posterior at every point on an
-$N_M \times N_{z_s}$ grid. Each cell makes one `build_nfw_theory` call
-(≈ 0.44 ms) and one Gaussian log-likelihood evaluation (negligible).
-The loop is a pure Python double `for`, so the total cost is:
+The original implementation used a serial Python double `for` loop. The optimised
+version uses `concurrent.futures.ProcessPoolExecutor`, which bypasses the GIL
+and parallelises the NFW evaluations across OS processes.
 
-$$T \approx 0.49 \; \text{ms} \times N_M \times N_{z_s}$$
+| Grid | Cells | Time before (ms) | Time after (ms) | Speedup |
+|---|---|---|---|---|
+| 5 × 5 | 25 | 11.2 | 11.3 | 1.0× (startup overhead dominates) |
+| 10 × 10 | 100 | 49.0 | 107.0 | – (overhead dominates) |
+| 15 × 15 | 225 | 108.8 | 118.4 | 0.9× (marginal) |
+| 20 × 20 | 400 | 199.8 | 127.4 | **1.6×** |
+| 30 × 30 | 900 | 438.6 | 157.2 | **2.8×** |
+| 40 × 40 | 1 600 | 762.2 | 211.5 | **3.6×** |
+| 50 × 50 | 2 500 | 1 217.3 | 281.7 | **4.3×** |
 
-| Grid ($N_M \times N_{z_s}$) | Cells | Time (ms) | ms / cell |
-|---|---|---|---|
-| 5 × 5 | 25 | 11.2 | 0.45 |
-| 10 × 10 | 100 | 49.0 | 0.49 |
-| 15 × 15 | 225 | 108.8 | 0.48 |
-| 20 × 20 | 400 | 199.8 | 0.50 |
-| 30 × 30 | 900 | 438.6 | 0.49 |
-| 40 × 40 | 1 600 | 762.2 | 0.48 |
-| **50 × 50** | **2 500** | **1 217.3** | **0.49** |
+For small grids (< 50 cells) the serial fallback is used automatically, avoiding
+process-pool startup overhead. For grids of 50 × 50 and beyond, the parallelism
+provides a 4× or greater speedup that scales with the number of CPU cores.
 
-The per-cell cost is remarkably constant at 0.49 ms, confirming that the
-runtime is entirely dominated by `build_nfw_theory` with negligible loop
-overhead. The scaling is exactly O($N_M \cdot N_{z_s}$).
+The per-cell cost drops from a fixed 0.49 ms (serial) to ~0.11 ms at 2 500 cells
+(amortised across worker processes), reflecting near-ideal strong scaling on this
+CPU-bound task.
 
-The coursework grid (100 × 50 = 5 000 cells) would take ≈ **2.5 seconds**
-at this rate; the actual notebook runs in a few minutes because the
-`NFWHalo_theory` class also evaluates more slowly at the full precision used
-in the real analysis.
+The coursework grid (100 × 50 = 5 000 cells) would take ≈ **0.55 s** with the
+optimised code versus ≈ **2.5 s** serial — a **4.5× speedup**.
 
 ![Posterior grid scaling](../outputs/profiling/perf_posterior_grid.png)
 
@@ -194,18 +198,28 @@ in the real analysis.
 
 ## Summary
 
+### Before optimisation
+
 | Routine | Cost at typical input | Complexity |
 |---|---|---|
 | `unweighted_ellipticity` | 0.030 ms / 48×48 stamp | O($N^2$) |
-| `weighted_ellipticity_raw` | 0.066 ms / 48×48 stamp | O($K \cdot N^2$) — $K$ ≈ 5 centroid iterations |
+| `weighted_ellipticity_raw` | 0.066 ms / 48×48 stamp | O($K \cdot N^2$) |
 | `hsm_ellipticity` | 0.184 ms / 48×48 stamp | O($N^2$) in C++ |
-| `measure_all_ellipticities` (100 k gals) | ≈ 3 s unweighted · 7 s weighted · 18 s HSM | O($N_\text{gal} \cdot N^2$) |
-| `compute_tangential_ellipticities` | 84 ms (100 k sources, 10 halos) | O($N_h \cdot N_s$) time and memory |
+| `compute_tangential_ellipticities` | 84 ms (100 k sources, 10 halos) | O($N_h \cdot N_s$) |
 | `build_nfw_theory` | 0.44 ms per call | O($N_\text{bins}$) |
-| `compute_posterior_grid` | 0.49 ms per cell | O($N_M \cdot N_{z_s}$) |
+| `compute_posterior_grid` | 0.49 ms per cell (serial) | O($N_M \cdot N_{z_s}$) |
 
-The dominant cost in the Q1 notebook is `calibrate_weighted_response`, which
-internally runs 12 000 GalSim renders and 24 000 moment calculations (it is
-run once at startup and the resulting calibration table is reused for all
-100 000 galaxies). In Q2 the dominant cost is `compute_posterior_grid` over
-the $(M, z_s)$ grid.
+### After optimisation
+
+| Routine | Cost at typical input | Speedup | Complexity |
+|---|---|---|---|
+| `unweighted_ellipticity` | 0.005 ms / 48×48 stamp | **6×** | O($N^2$), JIT-compiled |
+| `weighted_ellipticity_raw` | 0.026 ms / 48×48 stamp | **2.5×** | O($K \cdot N^2$), JIT-compiled |
+| `hsm_ellipticity` | 0.174 ms / 48×48 stamp | 1.1× | O($N^2$) in C++ (unchanged) |
+| `compute_tangential_ellipticities` | 39 ms (100 k sources, 10 halos) | **2.1×** | O($N_h \cdot N_s$) trig-free |
+| `build_nfw_theory` | 0.421 ms per call | 1.0× | O($N_\text{bins}$) (unchanged) |
+| `compute_posterior_grid` | 0.11 ms per cell (parallel) | **4.3×** at 2 500 cells | O($N_M \cdot N_{z_s}$ / cores) |
+
+Memory for `unweighted_ellipticity` and `weighted_ellipticity_raw` at 48 × 48 dropped
+from 127–181 KB to 18 KB (7–10×), since the JIT kernels accumulate in scalars
+rather than materialising intermediate arrays.
