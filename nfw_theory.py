@@ -10,10 +10,10 @@ class NFWHalo_theory(NFWHalo):
     https://github.com/GalSim-developers/GalSim/blob/releases/2.8/galsim/nfw_halo.py#L112"""
     def get_tangential_shear(self, z_source, sep_arcsec):
         """
-        Return the tangential shear for sources at 
+        Return the tangential shear for sources at
         z_source, for angular separations sep_arcsec in
         arcseconds
-        
+
         Parameters
         ----------
         z_source: source redshift (float)
@@ -24,8 +24,11 @@ class NFWHalo_theory(NFWHalo):
         tangential shear as numpy array
         """
         #get separation in units of the scale radius
-        rs = sep_arcsec/self.rs_arcsec
-        #get source redshift-dependent amplitude 
+        rs = np.asarray(sep_arcsec / self.rs_arcsec, dtype=float)
+        #get source redshift-dependent amplitude
         ks = self._NFWHalo__ks(z_source)
-        #call existing but private method to compute the shear
-        return np.array([self._NFWHalo__gamma(r, ks) for r in rs])
+        # Vectorised call: __gamma accepts arrays when ks is broadcast to the
+        # same shape as rs.  This replaces the original Python list comprehension
+        # and eliminates per-element Python overhead.
+        ks_arr = np.full_like(rs, ks)
+        return self._NFWHalo__gamma(rs, ks_arr)

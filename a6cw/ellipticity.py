@@ -353,30 +353,26 @@ def calibrate_weighted_response(
 
     print(f"Calibrating weighted-moment response on {len(hlr_grid)} galaxy sizes...")
     for hlr in hlr_grid:
-        e1_list = []
-        sg_list = []
-        for _ in range(n_per_hlr):
-            gal = galsim.Exponential(half_light_radius=hlr * pixel_scale)
-            gal = gal.shear(g1=shear_cal, g2=0.0)
-            im = gal.drawImage(
-                scale=pixel_scale, nx=stamp_size, ny=stamp_size, method="auto"
-            )
-            e1, _ = weighted_ellipticity_raw(im, fwhm_px=fwhm_px)
-            e1_list.append(e1)
-            try:
-                sg_list.append(galsim.hsm.FindAdaptiveMom(im).moments_sigma)
-            except galsim.GalSimHSMError:
-                sg_list.append(np.nan)
+        # Noiseless stamps are fully deterministic: every draw for the same
+        # (hlr, shear_cal, fwhm_px, stamp_size) is pixel-identical.  Drawing
+        # n_per_hlr times and averaging is therefore equivalent to a single
+        # draw followed by a single measurement — so we draw once.
+        gal = galsim.Exponential(half_light_radius=hlr * pixel_scale)
+        gal = gal.shear(g1=shear_cal, g2=0.0)
+        im  = gal.drawImage(
+            scale=pixel_scale, nx=stamp_size, ny=stamp_size, method="auto"
+        )
+        e1, _ = weighted_ellipticity_raw(im, fwhm_px=fwhm_px)
+        try:
+            sg_med = galsim.hsm.FindAdaptiveMom(im).moments_sigma
+        except galsim.GalSimHSMError:
+            sg_med = np.nan
 
-        e1_arr = np.array(e1_list)
-        valid = np.isfinite(e1_arr)
-        if valid.sum() < 10:
+        if not np.isfinite(e1) or not np.isfinite(sg_med):
             continue
 
-        R = e1_arr[valid].mean() / shear_cal
-        sg_med = np.nanmedian(sg_list)
-
-        if not np.isfinite(sg_med) or not np.isfinite(R) or R <= 0:
+        R = e1 / shear_cal
+        if R <= 0:
             continue
 
         sigma_g_nodes.append(sg_med)

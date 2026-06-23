@@ -31,6 +31,9 @@ from a6cw.ellipticity import (
     unweighted_ellipticity,
     weighted_ellipticity_raw,
     hsm_ellipticity,
+    calibrate_weighted_response,
+    _unweighted_jit,
+    _weighted_jit,
 )
 from a6cw.shear import (
     compute_tangential_ellipticities,
@@ -100,6 +103,10 @@ estimators = {
 print("=" * 65)
 print("1. Ellipticity estimators — time and memory vs stamp size")
 print("=" * 65)
+
+# Trigger JIT compilation before timed section
+_unweighted_jit(np.zeros((4, 4), dtype=np.float64))
+_weighted_jit(np.zeros((4, 4), dtype=np.float64), 4.0, 20, 1e-3)
 
 stamps = {sz: make_stamp(sz) for sz in STAMP_SIZES}   # pre-render all stamps
 
@@ -362,3 +369,18 @@ print(f"  {'Grid':>8}  {'N_cells':>8}  {'time (ms)':>10}  {'ms/cell':>9}")
 for i, g in enumerate(GRID_SIZES):
     nc = pg_n_cells[i]
     print(f"  {g:2d}×{g:<2d}  {nc:8.0f}  {pg_times[i]:10.1f}  {pg_times[i]/nc:9.2f}")
+
+
+# ---------------------------------------------------------------------------
+# Section 5 — calibrate_weighted_response: timing
+# ---------------------------------------------------------------------------
+
+print("\n" + "=" * 65)
+print("5. calibrate_weighted_response — single-draw timing")
+print("=" * 65)
+
+t0 = time.perf_counter()
+sg_nodes, R_nodes = calibrate_weighted_response(n_per_hlr=1000)
+cal_time_ms = (time.perf_counter() - t0) * 1e3
+print(f"  Total: {cal_time_ms:.1f} ms  ({len(sg_nodes)} calibration points)")
+print(f"  Per HLR: {cal_time_ms / len(sg_nodes):.1f} ms")

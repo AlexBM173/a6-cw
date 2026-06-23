@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from pathlib import Path
+from scipy.integrate import cumulative_trapezoid
 from scipy.stats import chi2 as scipy_chi2
 
 from nfw_theory import NFWHalo_theory
@@ -160,17 +161,15 @@ def mean_tangential_shear(
             gt[:]     = mean
             gt_err[:] = np.where(has2, np.sqrt(np.maximum(var, 0.0) / n_f), np.nan)
     else:
-        # Weighted path: per-bin loop (less common; bincount with weights
-        # cannot handle the 1/sqrt(Σw) error formula directly)
-        for k in range(n_bins):
-            if not has2[k]:
-                continue
-            mk    = valid & (bin_idx == k)
-            et_k  = epsilon_t_pairs[mk]
-            w_k   = weights[mk]
-            w_sum = w_k.sum()
-            gt[k]     = (w_k * et_k).sum() / w_sum
-            gt_err[k] = np.sqrt(1.0 / w_sum)
+        # Weighted path: fully vectorised via np.bincount
+        bv   = bin_idx[valid]
+        et_v = epsilon_t_pairs[valid]
+        w_v  = weights[valid]
+        sw   = np.bincount(bv, weights=w_v,       minlength=n_bins)
+        swe  = np.bincount(bv, weights=w_v * et_v, minlength=n_bins)
+        safe_sw = np.where(sw > 0, sw, 1.0)
+        gt[:]     = np.where(has2, swe / safe_sw,              np.nan)
+        gt_err[:] = np.where(has2, np.sqrt(1.0 / safe_sw),    np.nan)
 
     return gt, gt_err, n_pairs
 
@@ -468,7 +467,8 @@ def plot_joint_posterior(
 
     def credible_interval_1d(x, p):
         """Return (lo, peak, hi) for the 68% credible interval."""
-        cdf = np.array([np.trapezoid(p[:k+1], x[:k+1]) for k in range(len(x))])
+        # cumulative_trapezoid is O(N); the previous list-comprehension was O(N²)
+        cdf = np.concatenate([[0.0], cumulative_trapezoid(p, x)])
         cdf /= cdf[-1]
         lo   = x[np.searchsorted(cdf, 0.16)]
         hi   = x[np.searchsorted(cdf, 0.84)]
@@ -587,8 +587,9 @@ def plot_mass_posterior_fixed_zs(
     norm   = np.trapezoid(p_mass, mass_grid)
     p_mass /= norm
 
-    cdf      = np.array([np.trapezoid(p_mass[:k+1], mass_grid[:k+1]) for k in range(len(mass_grid))])
-    cdf     /= cdf[-1]
+    # O(N) cumulative integration replacing the previous O(N²) list comprehension
+    cdf  = np.concatenate([[0.0], cumulative_trapezoid(p_mass, mass_grid)])
+    cdf /= cdf[-1]
     mass_lo  = mass_grid[np.searchsorted(cdf, 0.16)]
     mass_hi  = mass_grid[np.searchsorted(cdf, 0.84)]
     mass_map = mass_grid[np.argmax(p_mass)]
