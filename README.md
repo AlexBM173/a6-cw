@@ -52,7 +52,16 @@ python -m pytest tests/ -v
 
 All 82 tests should pass in under 5 seconds.
 
+## Running the profiling benchmarks
+
+```bash
+python profiling/run_profiling.py
+```
+
+Plots are written to `outputs/profiling/`.
+
 ## Documentation
 
 - [Package reference](docs/package.md) — API for `a6cw.ellipticity` and `a6cw.shear`
 - [Test documentation](docs/tests.md) — design rationale and analytic basis for every test class
+- [Performance and profiling](docs/performance.md) — measured timings, memory usage, and scaling plots
