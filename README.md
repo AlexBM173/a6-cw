@@ -1,5 +1,8 @@
 # a6-cw — Weak Gravitational Lensing Coursework
 
+[![Tests](https://github.com/AlexBM173/a6-cw/workflows/Tests/badge.svg)](https://github.com/AlexBM173/a6-cw/actions/workflows/tests.yml)
+[![Docs](https://readthedocs.org/projects/a6-cw/badge/?version=latest)](https://a6-cw.readthedocs.io/en/latest/)
+
 A6 assessment: measuring galaxy shapes and inferring halo masses from weak gravitational lensing.
 
 The analysis is split across two Jupyter notebooks (`question1.ipynb`, `question2.ipynb`). All reusable code lives in the `a6cw` Python package so the notebooks contain only top-level orchestration.
