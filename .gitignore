@@ -3,6 +3,11 @@ __pycache__/
 *.pyo
 .ipynb_checkpoints/
 *.Zone.Identifier
-data/
-outputs/
+# Ignore data files but track the directory and its README
+data/*
+!data/README.txt
+
+# Ignore output files but track the directory and its README
+outputs/*
+!outputs/README.txt
 docs/_build/
