@@ -1,8 +1,11 @@
 import os
 import sys
 
-# Make the package importable from the repo root
-sys.path.insert(0, os.path.abspath(".."))
+# Anchor to conf.py's own location so this works regardless of where
+# sphinx-build is invoked from (local, tox, ReadTheDocs, etc.)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+sys.path.insert(0, _ROOT)   # makes `a6cw` and `nfw_theory` importable
 
 # ---------------------------------------------------------------------------
 # Project metadata
@@ -31,9 +34,10 @@ myst_dmath_double_inline = True
 # ---------------------------------------------------------------------------
 # autodoc settings
 # ---------------------------------------------------------------------------
-# galsim and numba require compiled extensions unavailable on the RTD builder;
-# mock them so autodoc can import a6cw without errors.
-autodoc_mock_imports = ["galsim", "numba"]
+# galsim and numba require compiled extensions unavailable on the RTD builder.
+# nfw_theory (repo-root module) is mocked because it imports galsim at the
+# top level before Sphinx's mock machinery can intercept it.
+autodoc_mock_imports = ["galsim", "numba", "nfw_theory"]
 
 autodoc_default_options = {
     "members":          True,
