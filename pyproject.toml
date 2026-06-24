@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "a6cw"
 version = "1.0.0"
 description = "Weak gravitational lensing analysis — A6 coursework"
-authors = [{name = "Alex"}]
+authors = [{name = "Alex Blake Martín"}]
 requires-python = ">=3.11"
 dependencies = [
     "numpy",

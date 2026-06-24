@@ -11,8 +11,8 @@ sys.path.insert(0, _ROOT)   # makes `a6cw` and `nfw_theory` importable
 # Project metadata
 # ---------------------------------------------------------------------------
 project   = "a6cw"
-author    = "Alex"
-copyright = "2026, Alex"
+author    = "Alex Blake Martín"
+copyright = "2026, Alex Blake Martín"
 release   = "1.0.0"
 
 # ---------------------------------------------------------------------------

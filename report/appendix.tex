@@ -1,0 +1,485 @@
+%% ============================================================
+%% Appendix — Software package, test suite, and performance
+%% ============================================================
+
+\appendix
+
+% -------------------------------------------------------------------
+\section{Software Package: \texttt{a6cw}}
+\label{app:package}
+
+All analysis code is organised into the \texttt{a6cw} Python package (version
+1.0.0), hosted at \url{https://github.com/AlexBM173/a6-cw} with documentation
+at \url{https://a6-cw.readthedocs.io}. The package separates reusable
+algorithmic code from the two Jupyter notebooks, which contain only top-level
+orchestration. It is installed in development mode via \texttt{pyproject.toml}
+(\texttt{setuptools} build backend) and comprises two submodules:
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+\textbf{Module} & \textbf{Purpose} \\
+\hline
+\texttt{a6cw.ellipticity} & Galaxy shape estimators and response calibration \\
+\texttt{a6cw.shear}       & Shear profiles, NFW theory, posterior inference \\
+\hline
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------------------
+\subsection{\texttt{a6cw.ellipticity}}
+\label{app:ellipticity}
+
+This module implements three galaxy shape estimators and the
+simulation-based calibration scheme for the Gaussian-weighted moment
+estimator.
+
+\subsubsection*{Ellipticity convention}
+
+All three estimators return ellipticities in the \emph{distortion} convention.
+The quadrupole moments of the surface brightness $I(x,y)$ are
+\begin{equation}
+    Q_{ij} = \frac{\sum_{pq} I(p,q)\,(p_i - \bar{p}_i)(p_j - \bar{p}_j)}
+                  {\sum_{pq} I(p,q)},
+\end{equation}
+with flux-weighted centroid $\bar{p}_i$. The two ellipticity components are
+\begin{equation}
+    \epsilon_1 = \frac{Q_{11} - Q_{22}}{D}, \qquad
+    \epsilon_2 = \frac{2\,Q_{12}}{D}, \qquad
+    D = Q_{11} + Q_{22} + 2\sqrt{Q_{11}Q_{22} - Q_{12}^2}.
+\end{equation}
+For a pure ellipse with semi-axes $a \ge b$ this gives $|\epsilon| = (a-b)/(a+b)$,
+with $\epsilon_1 > 0$ ($\epsilon_2 = 0$) for an east--west elongation.
+
+\subsubsection*{Estimators}
+
+\begin{description}
+  \item[\texttt{unweighted\_ellipticity(image)}]
+    Computes $(\epsilon_1, \epsilon_2)$ from the raw unweighted second moments
+    of the pixel array. The centroid is found from unweighted first moments.
+    Returns \texttt{(nan, nan)} when the total flux is non-positive, the
+    determinant $Q_{11}Q_{22} - Q_{12}^2 < 0$ (noise-dominated), or the
+    resulting ellipticity magnitude exceeds unity.
+
+  \item[\texttt{weighted\_ellipticity\_raw(image, fwhm\_px, max\_iter, tol)}]
+    Computes $(\epsilon_1, \epsilon_2)$ from intensity weighted by a circular
+    Gaussian
+    \begin{equation}
+        W(x, y) = \exp\!\left(-\frac{(x-\bar{x}^W)^2 + (y-\bar{y}^W)^2}
+                                     {2\sigma_w^2}\right), \quad
+        \sigma_w = \frac{\mathrm{FWHM}}{2\sqrt{2\ln 2}}.
+    \end{equation}
+    The weighted centroid $(\bar{x}^W, \bar{y}^W)$ is found iteratively,
+    re-centring the weight on the current estimate until the shift falls below
+    \texttt{tol} pixels. The raw ellipticities returned are biased relative to
+    the true reduced shear because the fixed circular weight suppresses the
+    tangential signal; \texttt{apply\_simulation\_calibration} corrects for this.
+
+  \item[\texttt{hsm\_ellipticity(image)}]
+    Wraps \textsc{GalSim}'s \texttt{FindAdaptiveMom}
+    \citep{Hirata2003, Mandelbaum2005}, which iteratively adapts an elliptical
+    Gaussian weight to match the galaxy shape. Returns the reduced shear
+    $(g_1, g_2)$ and the best-fit circular Gaussian size $\sigma_g$ in pixels.
+\end{description}
+
+\subsubsection*{Calibration}
+
+The fixed circular weight introduces a multiplicative shear-response bias:
+the measured ellipticity $\hat\epsilon$ is related to the true reduced shear
+$g$ by $\hat\epsilon \approx R\,g$, where $R < 1$ depends on galaxy size
+relative to the weight width. \texttt{calibrate\_weighted\_response} estimates
+$R(\sigma_g)$ by drawing one noiseless \textsc{GalSim} \texttt{Exponential}
+profile at each of twelve half-light radii, applying a known shear
+$g_1 = 0.05$, and computing $R = \hat\epsilon_1 / g_1$. The result is a
+look-up table; \texttt{apply\_simulation\_calibration} divides each galaxy's
+raw ellipticities by its interpolated $R(\sigma_{g,i})$ using
+\texttt{np.interp}, clamping at the boundary of the calibrated range.
+
+\subsubsection*{Batch processing}
+
+\texttt{measure\_all\_ellipticities(stamps\_path)} loads all galaxy stamps
+from a multi-extension FITS file and applies all three estimators in parallel
+using a \texttt{ThreadPoolExecutor}. The Numba JIT kernels (see
+Section~\ref{app:performance}) and \textsc{GalSim}'s C\texttt{++} HSM
+implementation both release the Python GIL, enabling genuine thread-level
+parallelism.
+
+% -------------------------------------------------------------------
+\subsection{\texttt{a6cw.shear}}
+\label{app:shear}
+
+This module implements the full weak-lensing shear pipeline from galaxy
+positions and ellipticities to a Bayesian posterior on halo mass and source
+redshift.
+
+\subsubsection*{Module-level constants}
+
+Radial binning is fixed at module import time to ensure consistency across all
+pipeline functions:
+\begin{align*}
+    &\texttt{N\_BINS} = 10, \\
+    &\texttt{BIN\_EDGES} = \mathrm{logspace}(\log_{10}100,\, \log_{10}3600,\, 11)
+      \text{ [arcsec]}, \\
+    &\texttt{BIN\_CENTRES}_k = \sqrt{\texttt{BIN\_EDGES}_k \cdot \texttt{BIN\_EDGES}_{k+1}}
+      \quad\text{(geometric mean)}.
+\end{align*}
+
+\subsubsection*{Pipeline functions}
+
+\begin{description}
+  \item[\texttt{load\_positions(path)}]
+    Reads a two-column whitespace-separated text file of $(x, y)$ positions
+    in arcseconds, returning an \texttt{(N, 2)} array.
+
+  \item[\texttt{compute\_tangential\_ellipticities(halo\_pos, source\_pos,
+        $\epsilon_1$, $\epsilon_2$)}]
+    Forms all $N_h \times N_s$ halo--source pairs by NumPy broadcasting.
+    The tangential and cross components are computed via trig-free double-angle
+    identities,
+    \begin{equation}
+        \cos 2\phi = \frac{dx^2 - dy^2}{r^2}, \qquad
+        \sin 2\phi = \frac{2\,dx\,dy}{r^2},
+    \end{equation}
+    eliminating \texttt{arctan2}, \texttt{cos}, and \texttt{sin} calls over the
+    full pair array. Returns three flat arrays of length $N_h \times N_s$
+    containing the separation $r$ [arcsec], the tangential component
+    $\epsilon_t$ (E-mode), and the cross component $\epsilon_\times$ (B-mode).
+
+  \item[\texttt{mean\_tangential\_shear(r\_pairs, $\epsilon_t$, bin\_edges, weights)}]
+    Bins tangential ellipticities into the ten logarithmically-spaced radial
+    bins. In the weak-lensing regime $\langle\epsilon_t\rangle = \gamma_t$, so
+    the mean tangential ellipticity directly estimates the shear.
+    Bin assignment uses a single \texttt{np.digitize} pass [$O(N\log B)$]; per-bin
+    sums use \texttt{np.bincount}. The unweighted uncertainty is the
+    Bessel-corrected standard error on the mean; an optional
+    inverse-variance weighted path is also provided. Bins with fewer than two
+    valid pairs return \texttt{nan}.
+
+  \item[\texttt{build\_nfw\_theory(mass, source\_redshift, ...)}]
+    Evaluates the predicted mean tangential shear at \texttt{BIN\_CENTRES} for
+    an NFW halo using the \texttt{NFWHalo\_theory} helper (a thin wrapper
+    around \textsc{GalSim}'s \texttt{NFWHalo}). Default parameters
+    ($c = 4$, $z_l = 0.3$, $\Omega_m = 0.3$, $\Omega_\Lambda = 0.7$) match
+    the simulation truth.
+
+  \item[\texttt{log\_likelihood(gt\_data, gt\_err, mass, source\_redshift)}]
+    Evaluates the Gaussian log-likelihood
+    \begin{equation}
+        \ln\mathcal{L} = -\frac{1}{2}
+        \sum_k \left(\frac{\hat\gamma_t^k - \gamma_t^{\mathrm{th}}(k)}
+                          {\sigma_k}\right)^2,
+    \end{equation}
+    summing only over bins where both data and theory are finite. Returns
+    $-\infty$ if no valid bins remain.
+
+  \item[\texttt{compute\_posterior\_grid(gt\_data, gt\_err, mass\_grid,
+        zs\_grid)}]
+    Evaluates the unnormalised log-posterior on a 2-D $(M,\,z_s)$ grid under
+    flat priors, distributing cells across OS processes via
+    \texttt{ProcessPoolExecutor} (with a serial fallback for grids smaller than
+    50 cells). Returns an $(N_M, N_{z_s})$ array.
+\end{description}
+
+\subsubsection*{Plotting utilities}
+
+The module also provides \texttt{plot\_tangential\_shear\_profiles},
+\texttt{plot\_cross\_shear\_null\_test}, \texttt{plot\_joint\_posterior},
+\texttt{plot\_mass\_posterior\_fixed\_zs}, and \texttt{plot\_best\_fit\_overlay},
+all writing PNG files to the \texttt{outputs/} directory.
+\texttt{plot\_joint\_posterior} and \texttt{plot\_mass\_posterior\_fixed\_zs}
+compute credible-interval boundaries using
+\texttt{scipy.integrate.cumulative\_trapezoid}, which performs the CDF
+integration in a single $O(N)$ pass.
+
+% -------------------------------------------------------------------
+\section{Test Suite}
+\label{app:tests}
+
+The package is tested by 82 unit tests spread across two files under
+\texttt{tests/}, runnable with
+\begin{verbatim}
+python -m pytest tests/ -v
+\end{verbatim}
+Tests run automatically on every push via a GitHub Actions workflow
+(\texttt{.github/workflows/tests.yml}) using Python~3.11 on
+\texttt{ubuntu-latest}. No files from \texttt{data/} or \texttt{outputs/} are
+required; all tests complete in under five seconds.
+
+\subsection*{Design principles}
+
+\textbf{Analytic ground truth where possible.} Most tests construct inputs with
+known mathematical properties and verify the output against a closed-form
+prediction, rather than comparing to a stored baseline. A failing test
+therefore points directly to the formula that is wrong.
+
+\textbf{\textsc{GalSim} profiles for shape estimators.} The three estimators
+operate on \texttt{galsim.Image} objects. Tests draw simple noiseless profiles
+(Gaussians with and without applied shear) using \texttt{drawImage} with
+\texttt{method='no\_pixel'}, which gives a pixel array matching the analytical
+profile to machine precision.
+
+\textbf{Edge cases alongside the happy path.} Every estimator test includes a
+zero-flux (or empty) input that should return \texttt{nan}, alongside the
+positive-signal cases.
+
+\textbf{Separation of concerns.} \texttt{test\_ellipticity.py} covers only
+\texttt{a6cw.ellipticity}; \texttt{test\_shear.py} covers only
+\texttt{a6cw.shear}, making failures easy to localise.
+
+\subsection{\texttt{tests/test\_ellipticity.py} (39 tests)}
+
+\begin{description}
+  \item[\texttt{TestPixelGrids} (6 tests)]
+    Verifies that \texttt{\_pixel\_grids} returns arrays of the correct shape,
+    that grids sum to zero (symmetric about the centre), that the centre pixel
+    is exactly zero for an odd stamp, and that $x$ varies along columns while
+    $y$ varies along rows.
+
+  \item[\texttt{TestGaussianWeight} (4 tests)]
+    Confirms the circular Gaussian weight $W = e^{-(dx^2+dy^2)/2\sigma^2}$ peaks
+    at unity at the origin, falls to $e^{-1/2}$ at one sigma, is symmetric in
+    $x$ and $y$, and is strictly positive everywhere.
+
+  \item[\texttt{TestUnweightedEllipticity} (8 tests)]
+    Checks that a circular Gaussian galaxy gives $(\epsilon_1,\epsilon_2)
+    \approx (0,0)$ to $<10^{-6}$; that a zero-flux stamp returns
+    \texttt{(nan,\,nan)}; that axis-aligned sheared Gaussians recover the
+    closed-form value $\epsilon_1 = (\sigma_x - \sigma_y)/(\sigma_x + \sigma_y)$
+    to $0.1\%$; that a 45$^\circ$-rotated galaxy produces pure $\epsilon_2$; that
+    a \textsc{GalSim} Gaussian with $g_1 = 0.3$ returns $\epsilon_1 = 0.3$ to
+    $<10^{-5}$ relative error (the exact identity $\epsilon_1 = g_1$ for a
+    Gaussian); and that results are bounded by unity.
+
+  \item[\texttt{TestWeightedEllipticity} (6 tests)]
+    Analogous tests for the Gaussian-weighted estimator, including a check that
+    a wider weight FWHM increases the raw $\epsilon_1$ response (because it
+    captures more of the galaxy's ellipticity signal).
+
+  \item[\texttt{TestHSMEllipticity} (6 tests)]
+    Verifies that circular galaxies give zero HSM shear, that $\sigma_g > 0$,
+    that $g_1$ and $g_2$ are recovered to $<10^{-4}$ relative error on noiseless
+    Gaussian profiles, that empty images return \texttt{nan}, and that $\sigma_g$
+    increases monotonically with galaxy size.
+
+  \item[\texttt{TestOLSThroughOrigin} (4 tests)]
+    Confirms the force-through-origin OLS regression recovers a known slope
+    exactly, recovers a noisy slope to $<1\%$ with 2000 points, filters
+    \texttt{nan} values, and recovers negative slopes.
+
+  \item[\texttt{TestApplySimulationCalibration} (5 tests)]
+    Verifies that unit response is the identity; half response doubles
+    ellipticity; \texttt{nan} ellipticities remain \texttt{nan}; galaxies with
+    \texttt{nan} $\sigma_g$ use the sample median before interpolation; and
+    $\sigma_g$ values outside the calibration range are clamped to the nearest
+    boundary node.
+\end{description}
+
+\subsection{\texttt{tests/test\_shear.py} (43 tests)}
+
+\begin{description}
+  \item[\texttt{TestModuleConstants} (7 tests)]
+    Checks that \texttt{BIN\_EDGES} has $N_\mathrm{bins}+1$ elements,
+    \texttt{BIN\_CENTRES} are the geometric means of adjacent edges, edges are
+    strictly increasing, the range spans 100--3600 arcsec, and that
+    \texttt{COLOURS} and \texttt{LABELS} both contain the three method keys.
+
+  \item[\texttt{TestLoadPositions} (3 tests)]
+    Verifies round-trip I/O: write with \texttt{np.savetxt}, read with
+    \texttt{load\_positions}, confirm shape $(N, 2)$ and value preservation
+    (including negative and decimal coordinates).
+
+  \item[\texttt{TestComputeTangentialEllipticities} (7 tests)]
+    Uses three exact analytic cases for the rotation formula:
+    \begin{center}
+    \begin{tabular}{llll}
+    \hline
+    Source direction & $\phi$ & $\epsilon_t$ & $\epsilon_\times$ \\
+    \hline
+    East ($x > 0$) & $0$ & $-\epsilon_1$ & $0$ \\
+    North ($y > 0$) & $\pi/2$ & $+\epsilon_1$ & $0$ \\
+    Northeast ($\phi = \pi/4$, $\epsilon_2 = 1$) & $\pi/4$ & $-\epsilon_2$ & $0$ \\
+    \hline
+    \end{tabular}
+    \end{center}
+    Also checks the 3--4--5 right-triangle separation formula, output shape for
+    $N_h = 7$, $N_s = 13$, and that zero input ellipticity gives zero output.
+
+  \item[\texttt{TestMeanTangentialShear} (7 tests)]
+    Uses a two-bin layout with four known pairs to test: correct mean, pair
+    count, standard error ($\sigma = \sqrt{0.02}/\sqrt{2} = 0.1$ for
+    $\{0.4,\,0.6\}$); \texttt{nan} for single-pair bins; \texttt{nan} exclusion
+    from counts; empty-bin \texttt{nan}; and zero error for uniform values.
+
+  \item[\texttt{TestEstimateShapeNoiseVariance} (4 tests)]
+    Confirms known variance ($\{1,{-}1\}$ gives 2 with \texttt{ddof=1}),
+    \texttt{nan} exclusion, zero variance for constant arrays, and a
+    \texttt{float} return type.
+
+  \item[\texttt{TestOptimalWeights} (4 tests)]
+    Checks equal weights for uniform noise, zero weight for \texttt{nan} pairs,
+    positive weight for finite pairs, and $w = 1/\hat\sigma_\epsilon^2$.
+
+  \item[\texttt{TestBuildNFWTheory} (6 tests)]
+    Verifies output length equals \texttt{N\_BINS}; all values positive; profile
+    decreasing with radius; higher mass gives stronger shear at all radii; higher
+    source redshift gives stronger shear; and non-default cosmological parameters
+    are accepted.
+
+  \item[\texttt{TestLogLikelihood} (5 tests)]
+    Confirms a perfect fit gives $\ln\mathcal{L} = 0$; an imperfect fit gives
+    $\ln\mathcal{L} < 0$; a larger residual gives a more negative
+    log-likelihood; \texttt{nan} bins are silently excluded; and all-\texttt{nan}
+    data returns $-\infty$.
+\end{description}
+
+% -------------------------------------------------------------------
+\section{Performance and Profiling}
+\label{app:performance}
+
+All benchmarks were measured on WSL2 (Windows Subsystem for Linux),
+Python~3.11.11, NumPy~2.x, \textsc{GalSim}~2.8.4, and Numba~0.65.1.
+Wall-clock times are medians over 50--100 repeated calls with one warm-up call
+excluded. Peak heap memory is measured with Python's \texttt{tracemalloc}.
+Profiling code and plot generation are in \texttt{profiling/run\_profiling.py};
+plots are written to \texttt{outputs/profiling/}.
+
+\subsection{Optimisations implemented}
+
+Eleven optimisations were applied across the two modules and the vendored
+\texttt{nfw\_theory.py} file.
+
+\begin{enumerate}
+  \item \textbf{Numba JIT for unweighted moments.}
+    The three-pass pixel loop in \texttt{unweighted\_ellipticity} is compiled by
+    Numba (\texttt{@njit(cache=True, nogil=True)}). Intermediate quantities are
+    accumulated in scalar registers, eliminating all temporary NumPy array
+    allocations.
+
+  \item \textbf{Numba JIT for weighted moments.}
+    The same treatment for \texttt{weighted\_ellipticity\_raw}, with additional
+    micro-optimisations: \texttt{inv\_2s2} $= 1/(2\sigma^2)$ is precomputed
+    once outside the centroid loop, and convergence is tested as
+    $|\Delta\bar{x}|^2 < \epsilon^2$ to avoid a square root per iteration.
+
+  \item \textbf{\texttt{lru\_cache} on pixel grids.}
+    The coordinate offset grids are cached by stamp shape via
+    \texttt{functools.lru\_cache(maxsize=32)}, so repeated calls on same-size
+    stamps incur no allocation cost.
+
+  \item \textbf{\texttt{ThreadPoolExecutor} in \texttt{measure\_all\_ellipticities}.}
+    Both Numba JIT kernels and \textsc{GalSim}'s C\texttt{++} HSM implementation
+    release the Python GIL, so a thread pool achieves genuine parallelism across
+    galaxy stamps.
+
+  \item \textbf{Single \textsc{GalSim} draw per HLR in
+        \texttt{calibrate\_weighted\_response}.}
+    Noiseless stamps with fixed parameters are fully deterministic; the original
+    loop drew 1000 pixel-identical stamps and averaged them. Reducing to one draw
+    per HLR gives a ${\sim}1000\times$ reduction in GalSim renders
+    ($12\,000 \to 12$).
+
+  \item \textbf{Trig-free double-angle identities in
+        \texttt{compute\_tangential\_ellipticities}.}
+    $\cos 2\phi = (dx^2-dy^2)/r^2$ and $\sin 2\phi = 2\,dx\,dy/r^2$ eliminate
+    \texttt{arctan2}, \texttt{cos}, and \texttt{sin} calls over the
+    $N_h \times N_s$ pair array.
+
+  \item \textbf{\texttt{np.digitize\,+\,np.bincount} in
+        \texttt{mean\_tangential\_shear} (unweighted).}
+    A single $O(N\log B)$ digitize pass replaces $B$ repeated boolean
+    masks [$O(NB)$ total].
+
+  \item \textbf{\texttt{np.bincount} weighted path.}
+    Per-bin loops for the inverse-variance weighted sums are replaced with
+    vectorised \texttt{np.bincount} calls.
+
+  \item \textbf{\texttt{ProcessPoolExecutor} in \texttt{compute\_posterior\_grid}.}
+    The NFW theory evaluation holds the GIL; separate OS processes bypass it.
+
+  \item \textbf{\texttt{cumulative\_trapezoid} for CDF computation.}
+    The $O(N^2)$ list comprehension
+    \texttt{[np.trapezoid(p[:k+1], x[:k+1]) for k in range(N)]} is replaced
+    by \texttt{scipy.integrate.cumulative\_trapezoid} [$O(N)$], which also
+    avoids accumulation of floating-point rounding from repeated prefix sums.
+
+  \item \textbf{Vectorised \texttt{NFWHalo.\_\_gamma} in
+        \texttt{nfw\_theory.get\_tangential\_shear}.}
+    \textsc{GalSim}'s private \texttt{\_\_gamma(r, ks)} accepts arrays;
+    broadcasting \texttt{ks\_arr = np.full\_like(rs, ks)} replaces a Python
+    loop over 10 radial bins with one vectorised C-level call.
+\end{enumerate}
+
+\subsection{Results}
+
+Table~\ref{tab:perf} summarises the before/after wall-clock times at
+representative input sizes, and Table~\ref{tab:mem} summarises peak heap
+memory for the two moment estimators.
+
+\begin{table}[h]
+\centering
+\caption{Wall-clock performance before and after all optimisations (medians).
+         The \texttt{calibrate\_weighted\_response} entry combines optimisations
+         5 and 4; the posterior grid entry combines optimisations 9 and 11.}
+\label{tab:perf}
+\small
+\begin{tabular}{lrrr}
+\hline
+\textbf{Routine (input size)} & \textbf{Before} & \textbf{After} & \textbf{Speedup} \\
+\hline
+\texttt{unweighted\_ellipticity} ($48\times48$ px) & 0.030\,ms & 0.007\,ms & $4\times$ \\
+\texttt{weighted\_ellipticity\_raw} ($48\times48$ px) & 0.066\,ms & 0.025\,ms & $2.6\times$ \\
+\texttt{hsm\_ellipticity} ($48\times48$ px) & 0.184\,ms & 0.175\,ms & $1.1\times$ \\
+\texttt{calibrate\_weighted\_response} (12 HLRs) & ${\sim}14\,\mathrm{s}$ & 60\,ms & ${\sim}230\times$ \\
+\texttt{compute\_tangential\_ellipticities} ($10^5$ sources) & 84\,ms & 39\,ms & $2.2\times$ \\
+\texttt{build\_nfw\_theory} (10 bins) & 0.421\,ms & 0.070\,ms & $6\times$ \\
+\texttt{compute\_posterior\_grid} ($2\,500$ cells) & 1\,217\,ms & 131\,ms & $9.3\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Peak heap memory for the two pixel-based moment estimators at
+         $48\times48$ pixels. HSM (C\texttt{++}) is unchanged.}
+\label{tab:mem}
+\begin{tabular}{lrrr}
+\hline
+\textbf{Estimator} & \textbf{Before} & \textbf{After} & \textbf{Reduction} \\
+\hline
+Unweighted moments & 127\,KB & 18\,KB & $7\times$ \\
+Gaussian-weighted moments & 181\,KB & 18\,KB & $10\times$ \\
+HSM (\textsc{GalSim}) & 13\,KB & 13\,KB & unchanged \\
+\hline
+\end{tabular}
+\end{table}
+
+The 18\,KB residual after optimisation equals the input array itself
+($48 \times 48 \times 8\,\mathrm{bytes} = 18\,\mathrm{KB}$), confirming that
+the Numba JIT kernels allocate no intermediate arrays.
+
+The dominant gain is \texttt{calibrate\_weighted\_response}: the ${\sim}230\times$
+speedup (not $1000\times$) reflects fixed per-HLR overhead in \textsc{GalSim}
+cosmology initialisation and pixel convolution that is unaffected by the draw-count
+reduction. The posterior-grid speedup of $9.3\times$ decomposes into approximately
+$6\times$ from the vectorised NFW call (opt.~11) and $1.6\times$ additional from
+\texttt{ProcessPoolExecutor} (opt.~9) at 2\,500 cells. The coursework grid
+($100 \times 50 = 5\,000$ cells) completes in ${\approx}0.35\,\mathrm{s}$
+versus the original ${\approx}2.5\,\mathrm{s}$ ($7\times$).
+
+\subsection{Scaling behaviour}
+
+The ellipticity estimators scale as $O(N_\mathrm{px})$ in the number of pixels
+($N_\mathrm{px} = N^2$ for an $N\times N$ stamp). At small stamps the measured
+log--log slope is below unity (0.84 for unweighted, 1.12 for weighted) because
+fixed Numba dispatch overhead dominates at a few hundred pixels; above
+$128\times128$ all estimators approach the asymptotic linear regime.
+
+\texttt{compute\_tangential\_ellipticities} scales as $O(N_h \cdot N_s)$, with
+a measured log--log slope of ${\approx}1.0$ confirming linear scaling with
+source count at fixed halo count. At $10^5$ sources and 10 halos, peak
+memory is ${\approx}77\,\mathrm{MB}$ ($10^6$ double-precision pairs $\times$
+three arrays).
+
+The posterior grid scales as $O(N_M \cdot N_{z_s} / N_\mathrm{cores})$ with
+\texttt{ProcessPoolExecutor}. At 2\,500 cells the per-cell amortised cost is
+0.05\,ms, compared to 0.49\,ms in the original serial implementation.
