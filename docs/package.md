@@ -5,8 +5,8 @@ It is organised into two modules:
 
 | Module | Purpose |
 |---|---|
-| [`a6cw.ellipticity`](#a6cwellipticity) | Galaxy shape estimators and response calibration |
-| [`a6cw.shear`](#a6cwshear) | Shear profiles, NFW theory, posterior inference |
+| `a6cw.ellipticity` | Galaxy shape estimators and response calibration |
+| `a6cw.shear` | Shear profiles, NFW theory, posterior inference |
 
 ---
 

@@ -26,10 +26,14 @@ LABELS  = {
 def load_positions(path: Path) -> np.ndarray:
     """
     Load (x, y) positions in arcseconds from a two-column text file.
-    Parameters -----------
+
+    Parameters
+    ----------
     path : Path
         Path to the text file containing positions.
-    Returns ---------
+
+    Returns
+    -------
     pos : np.ndarray
         Array of shape (N, 2) with columns [x, y] in arcseconds.
     """

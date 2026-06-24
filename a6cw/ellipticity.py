@@ -210,7 +210,7 @@ def unweighted_ellipticity(image: galsim.Image):
         epsilon_1 = (Q11 - Q22) / (Q11 + Q22 + 2 * sqrt(Q11 * Q22 - Q12^2))
         epsilon_2 = 2 * Q12 / (Q11 + Q22 + 2 * sqrt(Q11 * Q22 - Q12^2))
 
-    Measurements with |epsilon| > 1 (noise-dominated / diverging) are returned
+    Measurements with ``|epsilon| > 1`` (noise-dominated / diverging) are returned
     as (nan, nan) because they indicate a failed centroid or a stamp where
     the noise dominates the moment denominator.
 
@@ -244,25 +244,26 @@ def weighted_ellipticity_raw(image: galsim.Image, fwhm_px: float = 4.0, max_iter
     """
     Estimate (epsilon_1, epsilon_2) from weighted second-order moments,
     using the same lecture convention as the unweighted estimator but with
-    intensity I(x,y) replaced by W(x,y)*I(x,y):
+    intensity I(x,y) replaced by W(x,y)*I(x,y)::
 
         Q_pq^W = [sum_{xy} W(x,y) * I(x,y) * (p - pbar^W) * (q - qbar^W)]
                  / [sum_{xy} W(x,y) * I(x,y)]
 
         epsilon_1 = (Q_xx^W - Q_yy^W) / D^W
-        epsilon_2 = 2 * Q_xy^W         / D^W
+        epsilon_2 = 2 * Q_xy^W / D^W
         D^W = Q_xx^W + Q_yy^W + 2 * sqrt(Q_xx^W * Q_yy^W - (Q_xy^W)^2)
 
-    The weight function is a circular Gaussian:
+    The weight function is a circular Gaussian with
+    ``sigma = FWHM / (2*sqrt(2*ln2))``::
+
         W(x, y) = exp(-((x - xbar^W)^2 + (y - ybar^W)^2) / (2*sigma^2))
-    with sigma = FWHM / (2*sqrt(2*ln2)).
 
     The weighted centroid (xbar^W, ybar^W) is found iteratively:
-        1. Initialise with the unweighted centroid.
-        2. Centre the Gaussian weight on the current centroid estimate.
-        3. Recompute the centroid from weighted first moments:
-               xbar^W = sum(W * I * x) / sum(W * I)
-        4. Repeat until the centroid shifts by less than tol pixels.
+
+    1. Initialise with the unweighted centroid.
+    2. Centre the Gaussian weight on the current centroid estimate.
+    3. Recompute ``xbar^W = sum(W * I * x) / sum(W * I)``.
+    4. Repeat until the centroid shifts by less than *tol* pixels.
 
     This ensures the weight function is self-consistently centred on the
     weighted centroid, as required by the definition of Q_pq^W.

@@ -87,9 +87,9 @@ the input array itself (18 KB = 2 304 × 8 bytes for a 48 × 48 `float64` stamp)
 | Gaussian-weighted moments | 0.025 | 40 000 | 18 |
 | HSM (GalSim) | 0.175 | 5 700 | 13 |
 
-![Ellipticity scaling](../outputs/profiling/perf_ellipticity_scaling.png)
+![Ellipticity scaling](_static/plots/perf_ellipticity_scaling.png)
 
-![Throughput at 48 × 48](../outputs/profiling/perf_throughput.png)
+![Throughput at 48 × 48](_static/plots/perf_throughput.png)
 
 ---
 
@@ -137,7 +137,7 @@ two `np.arctan2` and two transcendental `cos`/`sin` calls over the full pair arr
 | 50 000 | 18.02 | 38.63 |
 | **100 000** | **38.81** | **77.25** |
 
-![Tangential shear scaling](../outputs/profiling/perf_tangential_scaling.png)
+![Tangential shear scaling](_static/plots/perf_tangential_scaling.png)
 
 ---
 
@@ -192,7 +192,7 @@ The per-cell cost falls from a fixed 0.49 ms (serial) to 0.05 ms at
 | 40 × 40 | 1 600 | 109.3 | 0.07 |
 | 50 × 50 | 2 500 | 131.3 | 0.05 |
 
-![Posterior grid scaling](../outputs/profiling/perf_posterior_grid.png)
+![Posterior grid scaling](_static/plots/perf_posterior_grid.png)
 
 ---
 

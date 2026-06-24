@@ -5,3 +5,4 @@ __pycache__/
 *.Zone.Identifier
 data/
 outputs/
+docs/_build/
