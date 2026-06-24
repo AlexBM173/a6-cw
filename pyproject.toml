@@ -12,6 +12,9 @@ dependencies = [
     "numpy",
     "scipy",
     "matplotlib",
+    # galsim and numba are required at runtime but omitted here because they
+    # carry compiled extensions that must be installed separately (see CI workflow).
+    # nfw_theory is vendored as a repo-root .py file; it is not a PyPI package.
 ]
 
 [project.optional-dependencies]
@@ -25,3 +28,7 @@ docs = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["a6cw*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+minversion = "7"

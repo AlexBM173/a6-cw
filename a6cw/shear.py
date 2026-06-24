@@ -158,12 +158,16 @@ def mean_tangential_shear(
             et_v = epsilon_t_pairs[valid]
             s1   = np.bincount(bv, weights=et_v,    minlength=n_bins)
             s2   = np.bincount(bv, weights=et_v**2, minlength=n_bins)
-            n_f  = n_pairs.astype(float)
-            mean = np.where(has2, s1 / n_f, np.nan)
+            n_f     = n_pairs.astype(float)
+            # Substitute 1.0 in empty bins so division never sees a zero
+            # denominator; np.where then masks those bins to nan anyway.
+            safe_n  = np.where(has2, n_f,       1.0)
+            safe_n1 = np.where(has2, n_f - 1.0, 1.0)
+            mean = np.where(has2, s1 / safe_n, np.nan)
             # Bessel-corrected variance: (Σx² − (Σx)²/n) / (n − 1)
-            var  = np.where(has2, (s2 - s1**2 / n_f) / (n_f - 1), np.nan)
+            var  = np.where(has2, (s2 - s1**2 / safe_n) / safe_n1, np.nan)
             gt[:]     = mean
-            gt_err[:] = np.where(has2, np.sqrt(np.maximum(var, 0.0) / n_f), np.nan)
+            gt_err[:] = np.where(has2, np.sqrt(np.maximum(var, 0.0) / safe_n), np.nan)
     else:
         # Weighted path: fully vectorised via np.bincount
         bv   = bin_idx[valid]
